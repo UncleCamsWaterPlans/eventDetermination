@@ -1,0 +1,131 @@
+---
+title: "bayesFlow"
+author: ""
+---
+
+## BayesFlow trial
+
+Through the ARC linkage project on anomaly detection, Edgar Santos-Fernandez has produced a software package for improved base-flow detection in river data. See: [bayesflow](https://github.com/EdgarSantos-Fernandez/bayesflow)
+
+This workbook has been developed to test the applicability of these methods to WQI's data and business needs.
+
+```{r}
+#ensure packages are installed and loading
+#install.packages("Rcpp")
+#devtools::install_github("EdgarSantos-Fernandez/bayesflow")
+#devtools::install_github("https://github.com/UncleCamsWaterPlans/waterQUAC")
+
+#ensure *Rtools* is installed and accesible from your R session
+
+library(tidyverse)
+library(Rcpp)
+library(rstan) #check startup messages
+library(bayesflow)
+library(waterQUAC)
+
+#setup your machine to leverage the cores in the CPU
+options(mc.cores = parallel::detectCores())
+rstan_options(auto_write = FALSE)
+
+#to test that Rstan works properly on your machine:
+#example(stan_model, package = "rstan", run.dontrun = TRUE)
+```
+
+## Import data and covariates (rainfall/upstream/downstream level)
+
+```{r}
+# import discharge data from WMIP (Barron River at Myola - 110001D)
+data <- waterQUAC::WMIP_Extract("110001D", 
+                                "20220801", 
+                                "discharge",
+                                END = format(Sys.Date() - 1, "%Y%m%d"))
+#add an NA because the data was too complete
+data[101,5] = NA
+
+
+# gridded rainfall data from that locaiton (SILO)
+rain <- waterQUAC::LongPaddock_grid(lat = "-16.802482195479286", 
+                                    long = "145.60880253264497",
+                                    start = "20220801",
+                                    username = "example@email.com.au")
+
+#complete the time series. Daily rainfall applied to hourly data
+rain <- rain %>%
+  arrange(Date) %>%
+  complete(Date = seq.POSIXt(min(Date), max(Date), by = "hour")) %>% 
+  fill(Rain, .direction = 'down')
+
+
+#join data frames
+data <- left_join(data, rain[,c(1,7)], by = join_by(time == Date) )
+data
+```
+
+## Run Model
+
+```{r}
+#having issues with removing NA's that don't exist?
+fit_lh <- baseflow(formula = value ~ Rain,
+                   data = data,
+                   method = 'lh',
+                  passes = 3)
+
+
+#tropubleshooting
+# lm <- mylm(formula = value ~ Rain,
+#                    data = data)
+# unique(!is.na(lm$y))
+
+
+```
+
+## Hidden Markov Model
+
+```{r}
+#test dataset
+y <- c(NA,5,7,108,117,57,36,26,95,1169,308,
+       144,89,62,48,40,35,73,82,342,393,310,
+       275,260,245,256,141,119,934,382,158,96,
+       122,103,83,67,148,NA,366,161,119,82,330,294,
+       261,266,153,247,703,498,286,163,124,85,94,
+       81,62,47,37,30,26,24,24,22,21,20,19,18,18,17,16,NA,20,19,18,18,NA)
+df <- data.frame(y = y, date = 1:length(y))
+
+ggplot(df) +
+  geom_line(aes(x = date , y = y))
+```
+
+```{r}
+#scale the target variable (discharge)
+data$y_st <- as.numeric(as.character(scale(data$value)))
+data_complete <- filter(data, !is.na(value))
+
+mod <-depmixS4:::depmix(
+    y_st ~ 1,
+    data = data_complete,
+    nstates = 2,
+    family = gaussian(),
+    instart = runif(2) # c(0.75, 0.25)
+  )
+
+fm <- depmixS4::fit(mod, verbose = FALSE, emc = depmixS4::em.control(rand = FALSE))
+
+est.states <- depmixS4::posterior(fm)
+table(est.states$state)
+```
+
+```{r}
+data$state <- NA
+
+data[!is.na(data$value),]$state <- est.states$state
+
+data$state2 <- case_when(
+  data$state == 1 ~ "ambient",
+  data$state == 2 ~ "event"
+)
+
+ggplot(data = data, aes(x = time , y = value)) +
+  geom_line() +
+  geom_point(aes(x = time , y = value, col = factor(state2))) +
+  theme_bw()
+```
